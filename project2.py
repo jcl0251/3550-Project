@@ -8,12 +8,11 @@ import jwt
 import datetime
 import sqlite3
 
-
-# Connection to SQLite
+# Database Connection
 db_connection = sqlite3.connect("totally_not_my_privateKeys.db", check_same_thread=False)
 db_cursor = db_connection.cursor()
 
-# Create keys if table hasn't been created yet
+# Create keys table if it doesn't exist
 db_cursor.execute('''
     CREATE TABLE IF NOT EXISTS keys(
         kid INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -21,14 +20,14 @@ db_cursor.execute('''
         exp INTEGER NOT NULL
     )
 ''')
-
 db_connection.commit()
 
+# Server configurations
 hostName = "localhost"
 serverPort = 8080
 
 def int_to_base64(value):
-    """Convert an integer to a Base64URL-encoded string"""
+    """Convert an integer to a Base64URL-encoded string."""
     value_hex = format(value, 'x')
     if len(value_hex) % 2 == 1:
         value_hex = '0' + value_hex
@@ -37,6 +36,7 @@ def int_to_base64(value):
     return encoded.decode('utf-8')
 
 def jwks_response():
+    """Generate JWKS JSON from unexpired keys."""
     print("jwks_response called", flush=True)
     all_keys = get_valid_keys_for_jwks()
     keys = [
@@ -44,56 +44,67 @@ def jwks_response():
             "alg": "RS256",
             "kty": "RSA",
             "use": "sig",
-            "kid": str(row[0]),  # Convert to string to fit schema
+            "kid": str(row[0]),
             "n": int_to_base64(serialization.load_pem_private_key(row[1], password=None).public_key().public_numbers().n),
             "e": int_to_base64(serialization.load_pem_private_key(row[1], password=None).public_key().public_numbers().e),
         }
         for row in all_keys
     ]
-    #print("JWKS Response:", keys, flush=True)
+    print("JWKS Response Keys:", keys, flush=True)
     return json.dumps({"keys": keys})
 
-def save_key_to_db(key, expiry, fixed_kid):
+def save_key_to_db(key, expiry, fixed_kid=None):
+    """Save a key in the database with an optional fixed_kid."""
     pem_key = key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption()
     )
-    db_cursor.execute("INSERT OR REPLACE INTO keys (kid, key, exp) VALUES (?, ?, ?)", (fixed_kid, pem_key, expiry))
+    if fixed_kid is None:
+        db_cursor.execute("INSERT INTO keys (key, exp) VALUES (?, ?)", (pem_key, expiry))
+    else:
+        db_cursor.execute("INSERT OR REPLACE INTO keys (kid, key, exp) VALUES (?, ?, ?)", (fixed_kid, pem_key, expiry))
     db_connection.commit()
 
 def get_key_from_db(expired=False):
+    """Retrieve a valid or expired key based on the expired parameter."""
     current_time = int(datetime.datetime.utcnow().timestamp())
-    if expired:
-        db_cursor.execute("SELECT kid, key FROM keys WHERE exp <= ? ORDER BY exp DESC LIMIT 1", (current_time,))
-    else:
-        db_cursor.execute("SELECT kid, key FROM keys WHERE exp > ? ORDER BY exp ASC LIMIT 1", (current_time,))
+    db_cursor.execute(
+        "SELECT kid, key FROM keys WHERE exp {} ? ORDER BY exp {} LIMIT 1".format(
+            "<=" if expired else ">", "DESC" if expired else "ASC"
+        ),
+        (current_time,)
+    )
     result = db_cursor.fetchone()
     return result if result else (None, None)
 
 def get_valid_keys_for_jwks():
-    db_cursor.execute("SELECT kid, key FROM keys")
+    """Retrieve all unexpired keys for JWKS."""
+    current_time = int(datetime.datetime.utcnow().timestamp())
+    db_cursor.execute("SELECT kid, key FROM keys WHERE exp > ?", (current_time,))
     result = db_cursor.fetchall()
-    #print("All keys in JWKS:", result, flush=True)
+    print("All valid keys for JWKS:", result, flush=True)
     return result
 
 def initialize_starter_keys():
+    """Initialize one expired and one valid key in the database."""
     print("Initializing starter keys...", flush=True)
     current_time = int(datetime.datetime.utcnow().timestamp())
-    expired_time = current_time - 3600  # One hour expired
-    valid_time = current_time + 3600    # One hour remaining
-    
-    # Insert a new expired key
+    expired_time = current_time - 3600  # Expired an hour ago
+    valid_time = current_time + 3600    # Valid for an hour
+
+    # Insert an expired key with a fixed ID
     expired_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    save_key_to_db(expired_key, expired_time, fixed_kid=1)  # Fixed ID for expired key
+    save_key_to_db(expired_key, expired_time, fixed_kid=1)
     print("Expired key inserted", flush=True)
-    
-    # Insert a new valid key
+
+    # Insert a valid key with a fixed ID
     valid_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    save_key_to_db(valid_key, valid_time, fixed_kid=2)      # Fixed ID for valid key
+    save_key_to_db(valid_key, valid_time, fixed_kid=2)
     print("Valid key inserted", flush=True)
-        
+
 def reset_database():
+    """Reset the database by dropping and recreating the keys table."""
     print("Resetting database...", flush=True)
     db_cursor.execute("DROP TABLE IF EXISTS keys")
     db_cursor.execute('''
@@ -104,7 +115,7 @@ def reset_database():
         )
     ''')
     db_connection.commit()
-
+    initialize_starter_keys()  # Re-initialize after reset
 
 class MyServer(BaseHTTPRequestHandler):
     
@@ -134,12 +145,11 @@ class MyServer(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"token": encoded_jwt}).encode("utf-8"))  # Return JWT in JSON format
+            self.wfile.write(json.dumps({"token": encoded_jwt}).encode("utf-8"))
             return
 
         self.send_response(405)
         self.end_headers()
-        return
 
     def do_GET(self):
         if self.path == "/.well-known/jwks.json":
@@ -151,20 +161,22 @@ class MyServer(BaseHTTPRequestHandler):
 
         self.send_response(405)
         self.end_headers()
-        return
-    
-reset_database()
-initialize_starter_keys()
 
+# Initialize database and start server
+reset_database()
 
 if __name__ == "__main__":
     webServer = HTTPServer((hostName, serverPort), MyServer)
     try:
+        print(f"Server started at http://{hostName}:{serverPort}")
         webServer.serve_forever()
     except KeyboardInterrupt:
         pass
 
     webServer.server_close()
+
+
+
 
 # Following guidelines in the syllabus, I used AI ())ChatGPT) to assist me with my errors and correct mistakes I made with the implementation of my code. 
 # I also used it to explain to me how the server should function and what exactly is different from the last project. 
