@@ -78,27 +78,32 @@ def get_valid_keys_for_jwks():
     return result
 
 def initialize_starter_keys():
-    #print("Initializing starter keys...", flush=True)
+    print("Initializing starter keys...", flush=True)
     current_time = int(datetime.datetime.utcnow().timestamp())
-    expired_time = current_time - 3600  # One hour in the past
-    valid_time = current_time + 3600  # One hour in the future
+    expired_time = current_time - 3600  # One hour expired
+    valid_time = current_time + 3600    # One hour remaining
     
-    # Insert expired key with fixed `kid` 1 if not present
-    db_cursor.execute("SELECT kid FROM keys WHERE kid = 1")
-    if db_cursor.fetchone() is None:
-        expired_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        save_key_to_db(expired_key, expired_time, fixed_kid=1)
-        #print("Expired key with fixed kid inserted", flush=True)
-    else:
-        print("Expired key already exists in DB", flush=True)
-
-    # Insert valid key if no valid keys are found
-    if get_key_from_db(expired=False)[0] is None:
-        valid_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        save_key_to_db(valid_key, valid_time)
-        print("Valid key inserted", flush=True)
-    else:
-        print("Valid key already exists in DB", flush=True)
+    # Insert a new expired key
+    expired_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    save_key_to_db(expired_key, expired_time, fixed_kid=1)  # Fixed ID for expired key
+    print("Expired key inserted", flush=True)
+    
+    # Insert a new valid key
+    valid_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    save_key_to_db(valid_key, valid_time, fixed_kid=2)      # Fixed ID for valid key
+    print("Valid key inserted", flush=True)
+        
+def reset_database():
+    print("Resetting database...", flush=True)
+    db_cursor.execute("DROP TABLE IF EXISTS keys")
+    db_cursor.execute('''
+        CREATE TABLE keys (
+            kid INTEGER PRIMARY KEY AUTOINCREMENT,
+            key BLOB NOT NULL,
+            exp INTEGER NOT NULL
+        )
+    ''')
+    db_connection.commit()
 
 
 class MyServer(BaseHTTPRequestHandler):
@@ -148,6 +153,7 @@ class MyServer(BaseHTTPRequestHandler):
         self.end_headers()
         return
     
+reset_database()
 initialize_starter_keys()
 
 
