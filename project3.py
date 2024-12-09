@@ -63,6 +63,19 @@ db_cursor.execute('''
 ''')
 db_connection.commit()
 
+# Create auth_logs table if it doesn't exist
+db_cursor.execute('''
+    CREATE TABLE IF NOT EXISTS auth_logs(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_ip TEXT NOT NULL,
+        request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        user_id INTEGER,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )
+''')
+db_connection.commit()
+
+
 
 # Server configurations
 hostName = "localhost"
@@ -185,6 +198,8 @@ class MyServer(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed_path = urlparse(self.path)
         params = parse_qs(parsed_path.query)
+        
+        # AUTH
         if parsed_path.path == "/auth":
             expired = 'expired' in params
             kid, pem_key = get_key_from_db(expired)
@@ -209,6 +224,43 @@ class MyServer(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"token": encoded_jwt}).encode("utf-8"))
+            return
+
+        self.send_response(405)
+        self.end_headers()
+        
+        # REGISTER
+        if parsed_path.path == "/register":
+            content_length = int(self.headers['Content-Length'])
+            body = self.rfile.read(content_length).decode('utf-8')
+            try:
+                data = json.loads(body)
+                username = data["username"]
+                email = data["email"]
+                
+                password = str(uuid.uuid4())
+                hashed_password = PassHasher.hash(password)
+                
+                try:
+                    db_cursor.execute(
+                        "INSERT INTO users (username, hashed_password, email) VALUES (?, ?, ?)",
+                        (username, hashed_password, email)
+                    )
+                    db_connection.commit()
+                    
+                    # response
+                    self.send_response(201)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"password": password}).encode("utf-8"))
+                except:
+                    self.send_response(400) # error, throw 400
+                    self.end_headers()
+                    self.wfile.write(b"Username and/or email address already exists")
+            except (KeyError, ValueError) as e:
+                self.send_response(400) # error, throw 400
+                self.end_headers()
+                self.wfile.write(b"Invalid request.")
             return
 
         self.send_response(405)
@@ -247,7 +299,7 @@ if __name__ == "__main__":
 """
 - Can you explain how to approach encryption of private keys with symmetric AES encryption? Tell me the libraries needed and break this down in parts and explain each part and why it is necessary.
 - What is the difference between this method of encryption and using Cryptography.Fernet? 
-
+- Explain UUIDv4
 
 
 """
