@@ -95,8 +95,15 @@ def decrypt(encrypted_info):
     no_padding_decrypted_info = decrypted_info.rstrip(b' ')
     return no_padding_decrypted_info
 
+def log_auth_request(ip, user_id):
+    db_cursor.execute(
+        "INSERT INTO auth_logs (request_ip, user_id) VALUES (?, ?)",
+        (ip, user_id)
+    )
+    db_connection.commit()
+
 def int_to_base64(value):
-    """Convert an integer to a Base64URL-encoded string."""
+    # converts int to a base64 encoded string.
     value_hex = format(value, 'x')
     if len(value_hex) % 2 == 1:
         value_hex = '0' + value_hex
@@ -105,7 +112,7 @@ def int_to_base64(value):
     return encoded.decode('utf-8')
 
 def jwks_response():
-    """Generate JWKS JSON from unexpired keys."""
+    # generate JWKS JSON from unexpired keys
     print("jwks_response called", flush=True)
     all_keys = get_valid_keys_for_jwks()
     keys = [
@@ -123,7 +130,7 @@ def jwks_response():
     return json.dumps({"keys": keys})
 
 def save_key_to_db(key, expiry, fixed_kid=None):
-    """Saves key to db, encrypted"""
+    # Saves key to db, encrypted
     pem_key = key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
@@ -137,7 +144,7 @@ def save_key_to_db(key, expiry, fixed_kid=None):
     db_connection.commit()
 
 def get_key_from_db(expired=False):
-    """Gets key from db then decrypts it"""
+    # Gets key from db then decrypts it
     current_time = int(datetime.datetime.utcnow().timestamp())
     db_cursor.execute(
         "SELECT kid, key FROM keys WHERE exp {} ? ORDER BY exp {} LIMIT 1".format(
@@ -153,7 +160,7 @@ def get_key_from_db(expired=False):
     return None, None
 
 def get_valid_keys_for_jwks():
-    """Retrieve all unexpired keys for JWKS."""
+    # gets unexpired keys
     current_time = int(datetime.datetime.utcnow().timestamp())
     db_cursor.execute("SELECT kid, key FROM keys WHERE exp > ?", (current_time,))
     result = db_cursor.fetchall()
@@ -161,7 +168,7 @@ def get_valid_keys_for_jwks():
     return result
 
 def initialize_starter_keys():
-    """Initialize one expired and one valid key in the database."""
+    # Initialize 1 valid and 1 expired key in db
     print("Initializing starter keys...", flush=True)
     current_time = int(datetime.datetime.utcnow().timestamp())
     expired_time = current_time - 3600  # Expired an hour ago
@@ -178,7 +185,7 @@ def initialize_starter_keys():
     print("Valid key inserted", flush=True)
 
 def reset_database():
-    """Reset the database by dropping and recreating the keys table."""
+    # Reset the database by dropping and recreating the keys table
     print("Resetting database...", flush=True)
     db_cursor.execute("DROP TABLE IF EXISTS keys")
     db_cursor.execute('''
@@ -201,33 +208,61 @@ class MyServer(BaseHTTPRequestHandler):
         
         # AUTH
         if parsed_path.path == "/auth":
-            expired = 'expired' in params
-            kid, pem_key = get_key_from_db(expired)
+            content_length = int(self.headers['Content-Length'])
+            body = self.rfile.read(content_length).decode('utf-8')
             
-            if pem_key is None:
-                self.send_response(404)
+            
+            try:
+                data = json.loads(body)
+                username = data["username"]
+                
+                user_id = self.get_user_id_by_username(username)
+                if user_id is None: 
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(b"User not found")
+                    return
+                
+                
+                
+                expired = 'expired' in params
+                kid, pem_key = get_key_from_db(expired)
+                
+                if pem_key is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(b"Key not found")
+                    return
+            
+                private_key = serialization.load_pem_private_key(pem_key, password=None)
+                expiry_time = datetime.datetime.utcnow() + (datetime.timedelta(hours=1) if not expired else datetime.timedelta(hours=-1))
+            
+                headers = {"kid": str(kid)}
+                token_payload = {
+                    "user": username,
+                    "exp": expiry_time.timestamp()
+                }
+                encoded_jwt = jwt.encode(token_payload, private_key, algorithm="RS256", headers=headers)
+            
+                # Adding logging here
+                client_ip = self.client_address[0]
+                log_auth_request(client_ip, user_id)
+                
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(b"Key not found")
-                return
+                self.wfile.write(json.dumps({"token": encoded_jwt}).encode("utf-8"))
             
-            private_key = serialization.load_pem_private_key(pem_key, password=None)
-            expiry_time = datetime.datetime.utcnow() + (datetime.timedelta(hours=1) if not expired else datetime.timedelta(hours=-1))
-            
-            headers = {"kid": str(kid)}
-            token_payload = {
-                "user": "username",
-                "exp": expiry_time.timestamp()
-            }
-            encoded_jwt = jwt.encode(token_payload, private_key, algorithm="RS256", headers=headers)
-            
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"token": encoded_jwt}).encode("utf-8"))
+            except KeyError:
+                self.send_response(400) # username
+                self.end_headers()
+                self.wfile.write(b"Missing 'username'")
+            except json.JSONDecodeError:
+                self.send_response(400) # json
+                self.end_headers()
+                self.wfile.write(b"Invalid JSON format")
             return
-
-        self.send_response(405)
-        self.end_headers()
+        
         
         # REGISTER
         if parsed_path.path == "/register":
@@ -239,12 +274,12 @@ class MyServer(BaseHTTPRequestHandler):
                 email = data["email"]
                 
                 password = str(uuid.uuid4())
-                hashed_password = PassHasher.hash(password)
+                password_hash = PassHasher.hash(password)
                 
                 try:
                     db_cursor.execute(
-                        "INSERT INTO users (username, hashed_password, email) VALUES (?, ?, ?)",
-                        (username, hashed_password, email)
+                        "INSERT INTO users (username, password_hash, email) VALUES (?, ?, ?)",
+                        (username, password_hash, email)
                     )
                     db_connection.commit()
                     
@@ -253,7 +288,7 @@ class MyServer(BaseHTTPRequestHandler):
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
                     self.wfile.write(json.dumps({"password": password}).encode("utf-8"))
-                except:
+                except sqlite3.IntegrityError:
                     self.send_response(400) # error, throw 400
                     self.end_headers()
                     self.wfile.write(b"Username and/or email address already exists")
@@ -276,6 +311,11 @@ class MyServer(BaseHTTPRequestHandler):
 
         self.send_response(405)
         self.end_headers()
+        
+    def get_user_id_by_username(self, username):
+        db_cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
+        result = db_cursor.fetchone()
+        return result[0] if result else None
 
 # Initialize database and start server
 reset_database()
